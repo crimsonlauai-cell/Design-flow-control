@@ -1,4 +1,4 @@
-import { BrowserRouter, Routes, Route } from 'react-router-dom';
+import { HashRouter, Routes, Route } from 'react-router-dom';
 import MainLayout from './layouts/MainLayout';
 import Dashboard from './views/Dashboard';
 import ProjectDetail from './views/ProjectDetail';
@@ -6,7 +6,7 @@ import TimelineView from './views/TimelineView';
 
 function App() {
   return (
-    <BrowserRouter>
+    <HashRouter>
       <MainLayout>
         <Routes>
           <Route path="/" element={<Dashboard />} />
@@ -14,7 +14,7 @@ function App() {
           <Route path="/project/:projectId/package/:packageId/submission/:submissionId" element={<TimelineView />} />
         </Routes>
       </MainLayout>
-    </BrowserRouter>
+    </HashRouter>
   );
 }
 
