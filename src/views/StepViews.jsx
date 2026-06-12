@@ -5,6 +5,63 @@ import { getProjectById } from '../data/mockProjects';
 import { motion, AnimatePresence } from 'framer-motion';
 import { UploadCloud, FileText, CheckCircle, MessageSquare, Save, Link as LinkIcon, Image as ImageIcon, AlertCircle, Calendar, Bell, ShieldCheck, DollarSign, Send, Clock } from 'lucide-react';
 import clsx from 'clsx';
+import axios from 'axios';
+
+// Helper to post data to Google Apps Script bypassing CORS OPTIONS Preflight
+const postToGAS = (url, data) => {
+  return axios.post(url, JSON.stringify(data), {
+    headers: {
+      'Content-Type': 'text/plain;charset=utf-8'
+    }
+  });
+};
+
+// IndexedDB Helper for Local Mode File Storage
+const initDB = () => {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open('DesignFlowDB', 1);
+    request.onupgradeneeded = (e) => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains('files')) {
+        db.createObjectStore('files', { keyPath: 'id' });
+      }
+    };
+    request.onsuccess = (e) => resolve(e.target.result);
+    request.onerror = (e) => reject(e.target.error);
+  });
+};
+
+const saveFileToIndexedDB = async (id, base64Content, mimeType) => {
+  try {
+    const db = await initDB();
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction('files', 'readwrite');
+      const store = transaction.objectStore('files');
+      const request = store.put({ id, base64Content, mimeType });
+      request.onsuccess = () => resolve(true);
+      request.onerror = (e) => reject(e.target.error);
+    });
+  } catch (err) {
+    console.error('IndexedDB save failed:', err);
+    return false;
+  }
+};
+
+const getFileFromIndexedDB = async (id) => {
+  try {
+    const db = await initDB();
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction('files', 'readonly');
+      const store = transaction.objectStore('files');
+      const request = store.get(id);
+      request.onsuccess = (e) => resolve(e.target.result);
+      request.onerror = (e) => reject(e.target.error);
+    });
+  } catch (err) {
+    console.error('IndexedDB get failed:', err);
+    return null;
+  }
+};
 
 function Card({ title, children, className = "" }) {
   return (
@@ -15,20 +72,21 @@ function Card({ title, children, className = "" }) {
   );
 }
 
-function Input({ label, type = 'text', defaultValue = '', colSpan = 1 }) {
+function Input({ label, type = 'text', defaultValue, value, onChange, colSpan = 1 }) {
+  const inputProps = value !== undefined ? { value, onChange } : { defaultValue };
   return (
     <div className={`mb-4 ${colSpan > 1 ? `col-span-${colSpan}` : ''}`}>
       <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1.5">{label}</label>
       {type === 'textarea' ? (
         <textarea 
-          defaultValue={defaultValue}
+          {...inputProps}
           rows={3}
           className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-brand focus:outline-none focus:ring-1 focus:ring-brand bg-slate-50/50"
         />
       ) : (
         <input 
           type={type} 
-          defaultValue={defaultValue}
+          {...inputProps}
           className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-brand focus:outline-none focus:ring-1 focus:ring-brand bg-slate-50/50 text-slate-800"
         />
       )}
@@ -52,12 +110,30 @@ function Button({ children, variant = 'primary', icon: Icon, onClick }) {
   );
 }
 
+const getDynamicProject = (projectId) => {
+  const baseProject = getProjectById(projectId);
+  if (!baseProject) return null;
+  const localKey = `design_flow_project_packages_${projectId}`;
+  const cached = localStorage.getItem(localKey);
+  if (cached) {
+    try {
+      const parsed = JSON.parse(cached);
+      if (parsed.packages) {
+        return { ...baseProject, packages: parsed.packages };
+      }
+    } catch (e) {
+      console.error('Failed to parse cached dynamic project:', e);
+    }
+  }
+  return baseProject;
+};
+
 export default function StepViews() {
-  const { currentStep, currentRole, steps } = useAppContext();
+  const { currentStep, currentRole, steps, markStepActive } = useAppContext();
   const { projectId, packageId, submissionId } = useParams();
   
   const stepInfo = steps.find(s => s.id === currentStep);
-  const project = getProjectById(projectId) || {};
+  const project = getDynamicProject(projectId) || {};
   const details = project.details || {};
 
   const pkg = project.packages?.find(p => p.id === packageId) || {};
@@ -67,11 +143,23 @@ export default function StepViews() {
   const [approvalDate, setApprovalDate] = useState('');
   const [isFirstSubmission, setIsFirstSubmission] = useState(submission?.name?.includes('1st Submission') || false);
 
+  // Step 3: Controlled inputs states for database sync
+  const [packageTitle, setPackageTitle] = useState(`${pkg.name || ''} - ${submission.name || ''}`);
+  const [purposeContext, setPurposeContext] = useState('');
+  const [startDate, setStartDate] = useState('');
+  const [targetDesignDate, setTargetDesignDate] = useState('');
+  const [targetReviewDate, setTargetReviewDate] = useState('');
+  const [supportingDocs, setSupportingDocs] = useState([]);
+  const [isUploadingFile, setIsUploadingFile] = useState(false);
+
+
+
   const [inputProvider, setInputProvider] = useState('Client');
   const [inputReceiveDate, setInputReceiveDate] = useState(new Date().toISOString().split('T')[0]);
-  const [uploadedInputs, setUploadedInputs] = useState([
-    { id: 1, filename: 'Site_Survey_Report.pdf', providerType: 'Consultant', providerName: details.consultant || 'N/A', receiveDate: '2026-05-10' }
-  ]);
+  const [uploadedInputs, setUploadedInputs] = useState([]);
+  const [isUploadingInput, setIsUploadingInput] = useState(false);
+  const [step5Tab, setStep5Tab] = useState('draft');
+  const [step6Tab, setStep6Tab] = useState('formal');
 
   const [drafts, setDrafts] = useState([]);
   const [isDraftNotified, setIsDraftNotified] = useState(false);
@@ -151,18 +239,630 @@ export default function StepViews() {
   const [ctCostImpact, setCtCostImpact] = useState('');
   const [ctScheduleImpact, setCtScheduleImpact] = useState('');
 
-  const handleUploadDraft = () => {
+  // Step 2: Key Person states
+  const isTarget = projectId === 'P4010B' && 
+                   packageId?.toLowerCase() === 'foundation' && 
+                   (submissionId === 'sub-1' || 
+                    submissionId === 'sub-1-1st-submission' || 
+                    submission?.name?.toLowerCase() === '1st submission');
+
+  const [kpPD, setKpPD] = useState(isTarget ? 'Lau Shing Chi (Crimson)' : '');
+  const [kpEIC, setKpEIC] = useState(isTarget ? 'Wai Hon Man' : '');
+  const [kpPIC, setKpPIC] = useState(isTarget ? 'Wong Lok Kwan (Lok)' : '');
+  const [kpSafety, setKpSafety] = useState(isTarget ? 'So Ming Lok (Edvard)' : '');
+  const [kpSiteRep, setKpSiteRep] = useState(isTarget ? 'Chiu Kin Wing' : '');
+  const [kpQA, setKpQA] = useState(isTarget ? 'Chan Yuet Man (Moon)、Ng Yui Yau (Oceanna)' : '');
+  const [kpDesign, setKpDesign] = useState(isTarget ? 'Chan Wai Lok (Mars)' : '');
+  const [kpSec, setKpSec] = useState(isTarget ? 'Tam Kit Yi (Kit)' : '');
+  const [kpPQS, setKpPQS] = useState(isTarget ? 'Cheung Yee Man (Tobey)' : '');
+  const [kpPlantRep, setKpPlantRep] = useState('');
+  const [kpProcurement, setKpProcurement] = useState(isTarget ? 'Lun Yik Wun (Rachel)' : '');
+  const [kpElectrician, setKpElectrician] = useState('');
+  const [kpSupervisorEngineer, setKpSupervisorEngineer] = useState('');
+  const [kpAdminStaff, setKpAdminStaff] = useState('');
+  const [kpOthersStaff, setKpOthersStaff] = useState('');
+
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSaving, setIsSaving] = useState(false);
+
+  const applyState = (s) => {
+    if (s.submissionDate) setSubmissionDate(s.submissionDate);
+    if (s.approvalDate) setApprovalDate(s.approvalDate);
+    if (s.isFirstSubmission !== undefined) setIsFirstSubmission(s.isFirstSubmission);
+    if (s.packageTitle) setPackageTitle(s.packageTitle);
+    if (s.purposeContext) setPurposeContext(s.purposeContext);
+    if (s.startDate) setStartDate(s.startDate);
+    if (s.targetDesignDate) setTargetDesignDate(s.targetDesignDate);
+    if (s.targetReviewDate) setTargetReviewDate(s.targetReviewDate);
+    if (s.supportingDocs) setSupportingDocs(s.supportingDocs);
+    if (s.uploadedInputs) setUploadedInputs(s.uploadedInputs);
+    if (s.drafts) setDrafts(s.drafts);
+    if (s.isDraftNotified !== undefined) setIsDraftNotified(s.isDraftNotified);
+    if (s.comments) setComments(s.comments);
+    if (s.formalSubmissions) setFormalSubmissions(s.formalSubmissions);
+    if (s.consultantFeedbacks) setConsultantFeedbacks(s.consultantFeedbacks);
+    if (s.statutorySubmissions) setStatutorySubmissions(s.statutorySubmissions);
+    if (s.authorityComments) setAuthorityComments(s.authorityComments);
+    if (s.finalResponses) setFinalResponses(s.finalResponses);
+    if (s.approvals) setApprovals(s.approvals);
+    if (s.costTrackings) setCostTrackings(s.costTrackings);
+
+    // Step 2 with fallback if undefined to preserve defaults
+    setKpPD(s.kpPD !== undefined ? s.kpPD : (isTarget ? 'Lau Shing Chi (Crimson)' : ''));
+    setKpEIC(s.kpEIC !== undefined ? s.kpEIC : (isTarget ? 'Wai Hon Man' : ''));
+    setKpPIC(s.kpPIC !== undefined ? s.kpPIC : (isTarget ? 'Wong Lok Kwan (Lok)' : ''));
+    setKpSafety(s.kpSafety !== undefined ? s.kpSafety : (isTarget ? 'So Ming Lok (Edvard)' : ''));
+    setKpSiteRep(s.kpSiteRep !== undefined ? s.kpSiteRep : (isTarget ? 'Chiu Kin Wing' : ''));
+    setKpQA(s.kpQA !== undefined ? s.kpQA : (isTarget ? 'Chan Yuet Man (Moon)、Ng Yui Yau (Oceanna)' : ''));
+    setKpDesign(s.kpDesign !== undefined ? s.kpDesign : (isTarget ? 'Chan Wai Lok (Mars)' : ''));
+    setKpSec(s.kpSec !== undefined ? s.kpSec : (isTarget ? 'Tam Kit Yi (Kit)' : ''));
+    setKpPQS(s.kpPQS !== undefined ? s.kpPQS : (isTarget ? 'Cheung Yee Man (Tobey)' : ''));
+    setKpPlantRep(s.kpPlantRep !== undefined ? s.kpPlantRep : '');
+    setKpProcurement(s.kpProcurement !== undefined ? s.kpProcurement : (isTarget ? 'Lun Yik Wun (Rachel)' : ''));
+    setKpElectrician(s.kpElectrician !== undefined ? s.kpElectrician : '');
+    setKpSupervisorEngineer(s.kpSupervisorEngineer !== undefined ? s.kpSupervisorEngineer : '');
+    setKpAdminStaff(s.kpAdminStaff !== undefined ? s.kpAdminStaff : '');
+    setKpOthersStaff(s.kpOthersStaff !== undefined ? s.kpOthersStaff : '');
+  };
+
+  useEffect(() => {
+    const fetchState = async () => {
+      const apiUrl = import.meta.env.VITE_GAS_API_URL;
+      const localKey = `design_flow_state_${projectId}_${packageId}_${submissionId}`;
+      
+      const setDefaultFields = () => {
+        setKpPD(isTarget ? 'Lau Shing Chi (Crimson)' : '');
+        setKpEIC(isTarget ? 'Wai Hon Man' : '');
+        setKpPIC(isTarget ? 'Wong Lok Kwan (Lok)' : '');
+        setKpSafety(isTarget ? 'So Ming Lok (Edvard)' : '');
+        setKpSiteRep(isTarget ? 'Chiu Kin Wing' : '');
+        setKpQA(isTarget ? 'Chan Yuet Man (Moon)、Ng Yui Yau (Oceanna)' : '');
+        setKpDesign(isTarget ? 'Chan Wai Lok (Mars)' : '');
+        setKpSec(isTarget ? 'Tam Kit Yi (Kit)' : '');
+        setKpPQS(isTarget ? 'Cheung Yee Man (Tobey)' : '');
+        setKpPlantRep('');
+        setKpProcurement(isTarget ? 'Lun Yik Wun (Rachel)' : '');
+        setKpElectrician('');
+        setKpSupervisorEngineer('');
+        setKpAdminStaff('');
+        setKpOthersStaff('');
+      };
+
+      // 先從 localStorage 載入緩存以提供即時顯示
+      const cached = localStorage.getItem(localKey);
+      if (cached) {
+        try {
+          applyState(JSON.parse(cached));
+        } catch (e) {
+          console.error('Failed to parse cached state:', e);
+          setDefaultFields();
+        }
+      } else {
+        setDefaultFields();
+      }
+
+      if (!apiUrl || apiUrl.includes('YOUR_DEPLOYMENT_ID')) {
+        console.warn('API URL is not configured. Loaded only from localStorage.');
+        setIsLoading(false);
+        return;
+      }
+
+      try {
+        setIsLoading(true);
+        const res = await axios.get(apiUrl, {
+          params: {
+            action: 'getState',
+            projectId,
+            packageId,
+            submissionId
+          }
+        });
+        if (res.data && res.data.status === 'success' && res.data.stateData) {
+          const s = res.data.stateData;
+          applyState(s);
+          // 同步更新本地緩存
+          localStorage.setItem(localKey, JSON.stringify(s));
+        } else if (res.data && res.data.status === 'not_found') {
+          if (!cached) {
+            setDefaultFields();
+          }
+        }
+      } catch (err) {
+        console.error('Failed to load state from database:', err);
+      } finally {
+        setIsLoading(false);
+      }
+    };
+    fetchState();
+  }, [projectId, packageId, submissionId]);
+
+  const syncWithDatabase = async (updatedFields = {}) => {
+    const localKey = `design_flow_state_${projectId}_${packageId}_${submissionId}`;
+    const apiUrl = import.meta.env.VITE_GAS_API_URL;
+
+    markStepActive(currentStep);
+    setIsSaving(true);
+    const fullState = {
+      submissionDate: updatedFields.hasOwnProperty('submissionDate') ? updatedFields.submissionDate : submissionDate,
+      approvalDate: updatedFields.hasOwnProperty('approvalDate') ? updatedFields.approvalDate : approvalDate,
+      isFirstSubmission: updatedFields.hasOwnProperty('isFirstSubmission') ? updatedFields.isFirstSubmission : isFirstSubmission,
+      packageTitle: updatedFields.hasOwnProperty('packageTitle') ? updatedFields.packageTitle : packageTitle,
+      purposeContext: updatedFields.hasOwnProperty('purposeContext') ? updatedFields.purposeContext : purposeContext,
+      startDate: updatedFields.hasOwnProperty('startDate') ? updatedFields.startDate : startDate,
+      targetDesignDate: updatedFields.hasOwnProperty('targetDesignDate') ? updatedFields.targetDesignDate : targetDesignDate,
+      targetReviewDate: updatedFields.hasOwnProperty('targetReviewDate') ? updatedFields.targetReviewDate : targetReviewDate,
+      supportingDocs: updatedFields.hasOwnProperty('supportingDocs') ? updatedFields.supportingDocs : supportingDocs,
+      uploadedInputs: updatedFields.hasOwnProperty('uploadedInputs') ? updatedFields.uploadedInputs : uploadedInputs,
+      drafts: updatedFields.hasOwnProperty('drafts') ? updatedFields.drafts : drafts,
+      isDraftNotified: updatedFields.hasOwnProperty('isDraftNotified') ? updatedFields.isDraftNotified : isDraftNotified,
+      comments: updatedFields.hasOwnProperty('comments') ? updatedFields.comments : comments,
+      formalSubmissions: updatedFields.hasOwnProperty('formalSubmissions') ? updatedFields.formalSubmissions : formalSubmissions,
+      consultantFeedbacks: updatedFields.hasOwnProperty('consultantFeedbacks') ? updatedFields.consultantFeedbacks : consultantFeedbacks,
+      statutorySubmissions: updatedFields.hasOwnProperty('statutorySubmissions') ? updatedFields.statutorySubmissions : statutorySubmissions,
+      authorityComments: updatedFields.hasOwnProperty('authorityComments') ? updatedFields.authorityComments : authorityComments,
+      finalResponses: updatedFields.hasOwnProperty('finalResponses') ? updatedFields.finalResponses : finalResponses,
+      approvals: updatedFields.hasOwnProperty('approvals') ? updatedFields.approvals : approvals,
+      costTrackings: updatedFields.hasOwnProperty('costTrackings') ? updatedFields.costTrackings : costTrackings,
+
+      // Step 2 properties with dynamic fallbacks to ensure sheet writing always has content
+      kpPD: updatedFields.hasOwnProperty('kpPD') ? updatedFields.kpPD : (kpPD || (isTarget ? 'Lau Shing Chi (Crimson)' : '')),
+      kpEIC: updatedFields.hasOwnProperty('kpEIC') ? updatedFields.kpEIC : (kpEIC || (isTarget ? 'Wai Hon Man' : '')),
+      kpPIC: updatedFields.hasOwnProperty('kpPIC') ? updatedFields.kpPIC : (kpPIC || (isTarget ? 'Wong Lok Kwan (Lok)' : '')),
+      kpSafety: updatedFields.hasOwnProperty('kpSafety') ? updatedFields.kpSafety : (kpSafety || (isTarget ? 'So Ming Lok (Edvard)' : '')),
+      kpSiteRep: updatedFields.hasOwnProperty('kpSiteRep') ? updatedFields.kpSiteRep : (kpSiteRep || (isTarget ? 'Chiu Kin Wing' : '')),
+      kpQA: updatedFields.hasOwnProperty('kpQA') ? updatedFields.kpQA : (kpQA || (isTarget ? 'Chan Yuet Man (Moon)、Ng Yui Yau (Oceanna)' : '')),
+      kpDesign: updatedFields.hasOwnProperty('kpDesign') ? updatedFields.kpDesign : (kpDesign || (isTarget ? 'Chan Wai Lok (Mars)' : '')),
+      kpSec: updatedFields.hasOwnProperty('kpSec') ? updatedFields.kpSec : (kpSec || (isTarget ? 'Tam Kit Yi (Kit)' : '')),
+      kpPQS: updatedFields.hasOwnProperty('kpPQS') ? updatedFields.kpPQS : (kpPQS || (isTarget ? 'Cheung Yee Man (Tobey)' : '')),
+      kpPlantRep: updatedFields.hasOwnProperty('kpPlantRep') ? updatedFields.kpPlantRep : kpPlantRep,
+      kpProcurement: updatedFields.hasOwnProperty('kpProcurement') ? updatedFields.kpProcurement : (kpProcurement || (isTarget ? 'Lun Yik Wun (Rachel)' : '')),
+      kpElectrician: updatedFields.hasOwnProperty('kpElectrician') ? updatedFields.kpElectrician : kpElectrician,
+      kpSupervisorEngineer: updatedFields.hasOwnProperty('kpSupervisorEngineer') ? updatedFields.kpSupervisorEngineer : kpSupervisorEngineer,
+      kpAdminStaff: updatedFields.hasOwnProperty('kpAdminStaff') ? updatedFields.kpAdminStaff : kpAdminStaff,
+      kpOthersStaff: updatedFields.hasOwnProperty('kpOthersStaff') ? updatedFields.kpOthersStaff : kpOthersStaff,
+    };
+
+    // 隨時更新本地 localStorage 緩存
+    try {
+      localStorage.setItem(localKey, JSON.stringify(fullState));
+    } catch (e) {
+      console.warn('localStorage storage limit exceeded. Saving without base64 attachments.', e);
+      // 緩存超出限額時，移除大檔案的 base64 內容以保存一般輸入
+      const strippedDocs = fullState.supportingDocs.map(doc => ({
+        name: doc.name,
+        url: doc.url.startsWith('data:') ? '#' : doc.url
+      }));
+      const strippedState = { ...fullState, supportingDocs: strippedDocs };
+      try {
+        localStorage.setItem(localKey, JSON.stringify(strippedState));
+      } catch (innerErr) {
+        console.error('Failed to write to localStorage:', innerErr);
+      }
+    }
+
+    if (!apiUrl || apiUrl.includes('YOUR_DEPLOYMENT_ID')) {
+      console.warn('API URL is not configured. Saved to localStorage.');
+      setIsSaving(false);
+      return;
+    }
+
+    try {
+      await postToGAS(apiUrl, {
+        action: 'saveState',
+        projectId,
+        packageId,
+        submissionId,
+        stateData: fullState
+      });
+      console.log('State successfully saved to Google Sheets.');
+    } catch (err) {
+      console.error('Failed to save state to Google Sheets:', err);
+      const errMsg = err.response?.data?.message || err.message;
+      alert('儲存至雲端失敗（錯誤原因：' + errMsg + '），已為你保存至本地瀏覽器中。');
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleStep4FileUpload = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    setIsUploadingInput(true);
+    const startTime = Date.now();
+    const reader = new FileReader();
+    reader.onload = async (event) => {
+      const base64Content = event.target.result.split(',')[1];
+      const apiUrl = import.meta.env.VITE_GAS_API_URL;
+
+      let fileUrl = '#';
+
+      if (!apiUrl || apiUrl.includes('YOUR_DEPLOYMENT_ID')) {
+        const fileId = `input_file_${projectId}_${packageId}_${submissionId}_${Date.now()}_${file.name}`;
+        const saved = await saveFileToIndexedDB(fileId, base64Content, file.type);
+        fileUrl = saved ? `indexeddb://${fileId}` : event.target.result;
+      } else {
+        try {
+          const res = await postToGAS(apiUrl, {
+            type: 'upload',
+            fileName: file.name,
+            mimeType: file.type,
+            fileBase64: base64Content,
+            projectId,
+            packageId,
+            submissionId
+          });
+          if (res.data && res.data.status === 'success' && res.data.fileUrl) {
+            fileUrl = res.data.fileUrl;
+          } else {
+            throw new Error(res.data.message || 'Upload failed');
+          }
+        } catch (err) {
+          console.error('File upload to Google Drive failed:', err);
+          const errMsg = err.response?.data?.message || err.message;
+          alert(`上傳至雲端失敗（${errMsg}），已降級保存至本地瀏覽器。`);
+          const fileId = `input_file_${projectId}_${packageId}_${submissionId}_${Date.now()}_${file.name}`;
+          const saved = await saveFileToIndexedDB(fileId, base64Content, file.type);
+          fileUrl = saved ? `indexeddb://${fileId}` : event.target.result;
+        }
+      }
+
+      const newRecord = {
+        id: Date.now(),
+        filename: file.name,
+        providerType: inputProvider,
+        providerName: getProviderName(inputProvider),
+        receiveDate: inputReceiveDate,
+        url: fileUrl
+      };
+      const updated = [newRecord, ...uploadedInputs];
+      setUploadedInputs(updated);
+      syncWithDatabase({ uploadedInputs: updated });
+
+      const elapsed = Date.now() - startTime;
+      setTimeout(() => setIsUploadingInput(false), Math.max(0, 1000 - elapsed));
+    };
+    reader.readAsDataURL(file);
+    e.target.value = '';
+  };
+
+  const handleDownloadInput = async (doc) => {
+    if (!doc.url || doc.url === '#') {
+      alert('此文件沒有可用的下載連結。');
+      return;
+    }
+    if (doc.url.startsWith('indexeddb://')) {
+      const fileId = doc.url.replace('indexeddb://', '');
+      const fileRecord = await getFileFromIndexedDB(fileId);
+      if (fileRecord) {
+        const byteCharacters = atob(fileRecord.base64Content);
+        const byteArray = new Uint8Array(byteCharacters.length);
+        for (let i = 0; i < byteCharacters.length; i++) byteArray[i] = byteCharacters.charCodeAt(i);
+        const blob = new Blob([byteArray], { type: fileRecord.mimeType });
+        const blobUrl = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = blobUrl;
+        a.download = doc.filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(blobUrl);
+      } else {
+        alert('找不到本地檔案記錄。');
+      }
+    } else if (doc.url.startsWith('data:')) {
+      const a = document.createElement('a');
+      a.href = doc.url;
+      a.download = doc.filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    } else {
+      const driveIdMatch = doc.url.match(/\/d\/([a-zA-Z0-9_-]+)/);
+      const apiUrl = import.meta.env.VITE_GAS_API_URL;
+      if (driveIdMatch && apiUrl && !apiUrl.includes('YOUR_DEPLOYMENT_ID')) {
+        try {
+          const res = await axios.get(apiUrl, { params: { action: 'getFile', fileId: driveIdMatch[1] } });
+          if (res.data && res.data.status === 'success') {
+            const { base64Content, mimeType, fileName } = res.data;
+            const byteCharacters = atob(base64Content);
+            const byteArray = new Uint8Array(byteCharacters.length);
+            for (let i = 0; i < byteCharacters.length; i++) byteArray[i] = byteCharacters.charCodeAt(i);
+            const blob = new Blob([byteArray], { type: mimeType });
+            const blobUrl = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = blobUrl;
+            a.download = fileName || doc.filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(blobUrl);
+            return;
+          }
+        } catch (err) {
+          console.error('Failed to fetch file from GAS:', err);
+        }
+      }
+      window.open(doc.url, '_blank', 'noopener,noreferrer');
+    }
+  };
+
+  const handleDeleteInput = (id) => {
+    const updated = uploadedInputs.filter(f => f.id !== id);
+    setUploadedInputs(updated);
+    syncWithDatabase({ uploadedInputs: updated });
+  };
+
+  const handleStep3FileUpload = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    setIsUploadingFile(true);
+    const startTime = Date.now();
+    const reader = new FileReader();
+    reader.onload = async (event) => {
+      const base64Content = event.target.result.split(',')[1];
+      const apiUrl = import.meta.env.VITE_GAS_API_URL;
+      
+      let fileUrl = '#';
+      
+      if (!apiUrl || apiUrl.includes('YOUR_DEPLOYMENT_ID')) {
+        console.warn('API URL is not configured. Saving file to local IndexedDB.');
+        const fileId = `local_file_${projectId}_${packageId}_${submissionId}_${Date.now()}_${file.name}`;
+        const saved = await saveFileToIndexedDB(fileId, base64Content, file.type);
+        fileUrl = saved ? `indexeddb://${fileId}` : event.target.result;
+      } else {
+        try {
+          const res = await postToGAS(apiUrl, {
+            type: 'upload',
+            fileName: file.name,
+            mimeType: file.type,
+            fileBase64: base64Content,
+            projectId,
+            packageId,
+            submissionId
+          });
+          if (res.data && res.data.status === 'success' && res.data.fileUrl) {
+            fileUrl = res.data.fileUrl;
+          } else {
+            throw new Error(res.data.message || 'Google Drive upload returned error status.');
+          }
+        } catch (err) {
+          console.error('File upload to Google Drive failed:', err);
+          const errMsg = err.response?.data?.message || err.message;
+          alert(`上傳至雲端失敗（錯誤原因：${errMsg}），已為你降級保存至本地瀏覽器中。`);
+          const fileId = `local_file_${projectId}_${packageId}_${submissionId}_${Date.now()}_${file.name}`;
+          const saved = await saveFileToIndexedDB(fileId, base64Content, file.type);
+          fileUrl = saved ? `indexeddb://${fileId}` : event.target.result;
+        }
+      }
+
+      const updatedDocs = [...supportingDocs, { name: file.name, url: fileUrl }];
+      setSupportingDocs(updatedDocs);
+      syncWithDatabase({ supportingDocs: updatedDocs });
+
+      // 確保至少有 1000 毫秒的加載等待，提升 UI 反饋質感
+      const elapsed = Date.now() - startTime;
+      const delay = Math.max(0, 1000 - elapsed);
+      setTimeout(() => {
+        setIsUploadingFile(false);
+      }, delay);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleRemoveDoc = (index) => {
+    const updatedDocs = supportingDocs.filter((_, idx) => idx !== index);
+    setSupportingDocs(updatedDocs);
+    syncWithDatabase({ supportingDocs: updatedDocs });
+  };
+
+  const handleDownloadDoc = async (doc) => {
+    if (!doc.url) return;
+    
+    if (doc.url.startsWith('indexeddb://')) {
+      const fileId = doc.url.replace('indexeddb://', '');
+      const fileRecord = await getFileFromIndexedDB(fileId);
+      if (fileRecord) {
+        try {
+          const byteCharacters = atob(fileRecord.base64Content);
+          const byteNumbers = new Array(byteCharacters.length);
+          for (let i = 0; i < byteCharacters.length; i++) {
+            byteNumbers[i] = byteCharacters.charCodeAt(i);
+          }
+          const byteArray = new Uint8Array(byteNumbers);
+          const blob = new Blob([byteArray], { type: fileRecord.mimeType });
+          const blobUrl = URL.createObjectURL(blob);
+          
+          const a = document.createElement('a');
+          a.href = blobUrl;
+          a.download = doc.name;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(blobUrl);
+        } catch (err) {
+          console.error('Failed to parse and download IndexedDB file:', err);
+          alert('無法下載本地檔案：數據可能已損毀。');
+        }
+      } else {
+        alert('找不到此本地檔案的儲存記錄。');
+      }
+    } else if (doc.url.startsWith('data:')) {
+      try {
+        const a = document.createElement('a');
+        a.href = doc.url;
+        a.download = doc.name;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+      } catch (err) {
+        console.error('Failed to download data url:', err);
+        alert('點擊下載失敗，建議部署並配置 Google Apps Script 後端使用雲端儲存。');
+      }
+    } else if (doc.url === '#') {
+      alert('該文件只保留了檔名，其內容因為先前本地容量不足已被移除。請部署並配置 Google Apps Script 後端以使用雲端儲存。');
+    } else {
+      // 雲端 Google Drive URL：從 GAS 取回 base64 再以 Blob 開啟
+      const driveIdMatch = doc.url.match(/\/d\/([a-zA-Z0-9_-]+)/);
+      const apiUrl = import.meta.env.VITE_GAS_API_URL;
+      if (driveIdMatch && apiUrl && !apiUrl.includes('YOUR_DEPLOYMENT_ID')) {
+        const fileId = driveIdMatch[1];
+        try {
+          const res = await axios.get(apiUrl, { params: { action: 'getFile', fileId } });
+          if (res.data && res.data.status === 'success') {
+            const { base64Content, mimeType, fileName } = res.data;
+            const byteCharacters = atob(base64Content);
+            const byteArray = new Uint8Array(byteCharacters.length);
+            for (let i = 0; i < byteCharacters.length; i++) {
+              byteArray[i] = byteCharacters.charCodeAt(i);
+            }
+            const blob = new Blob([byteArray], { type: mimeType });
+            const blobUrl = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = blobUrl;
+            a.download = fileName || doc.name;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(blobUrl);
+          } else {
+            throw new Error(res.data?.message || 'getFile failed');
+          }
+        } catch (err) {
+          console.error('Failed to fetch file from GAS:', err);
+          // 降級：直接開新分頁
+          window.open(doc.url, '_blank', 'noopener,noreferrer');
+        }
+      } else {
+        window.open(doc.url, '_blank', 'noopener,noreferrer');
+      }
+    }
+  };
+
+  const handleUploadDraft = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
     const nextVersion = `D${drafts.length}`;
     const now = new Date();
     const timeString = now.toLocaleString('zh-HK', { hour12: false });
-    
-    setDrafts(prev => [{
-      id: prev.length + 1,
-      version: nextVersion,
-      uploadTime: timeString,
-      filename: `Submission_Draft_${nextVersion}.pdf`,
-    }, ...prev]);
-    setIsDraftNotified(false);
+    const apiUrl = import.meta.env.VITE_GAS_API_URL;
+
+    const reader = new FileReader();
+    reader.onload = async (event) => {
+      const base64Content = event.target.result.split(',')[1];
+      let fileUrl = '#';
+
+      if (!apiUrl || apiUrl.includes('YOUR_DEPLOYMENT_ID')) {
+        const fileId = `draft_file_${projectId}_${packageId}_${submissionId}_${Date.now()}_${file.name}`;
+        const saved = await saveFileToIndexedDB(fileId, base64Content, file.type);
+        fileUrl = saved ? `indexeddb://${fileId}` : event.target.result;
+      } else {
+        try {
+          const res = await postToGAS(apiUrl, {
+            type: 'upload',
+            fileName: file.name,
+            mimeType: file.type,
+            fileBase64: base64Content,
+            projectId,
+            packageId,
+            submissionId
+          });
+          if (res.data && res.data.status === 'success' && res.data.fileUrl) {
+            fileUrl = res.data.fileUrl;
+          } else {
+            throw new Error(res.data?.message || 'Upload failed');
+          }
+        } catch (err) {
+          console.error('Draft upload failed:', err);
+          alert(`上傳至雲端失敗，已降級保存至本地瀏覽器。`);
+          const fileId = `draft_file_${projectId}_${packageId}_${submissionId}_${Date.now()}_${file.name}`;
+          const saved = await saveFileToIndexedDB(fileId, base64Content, file.type);
+          fileUrl = saved ? `indexeddb://${fileId}` : event.target.result;
+        }
+      }
+
+      const updatedDrafts = [{
+        id: Date.now(),
+        version: nextVersion,
+        uploadTime: timeString,
+        filename: file.name,
+        url: fileUrl,
+      }, ...drafts];
+      setDrafts(updatedDrafts);
+      setIsDraftNotified(false);
+      syncWithDatabase({ drafts: updatedDrafts, isDraftNotified: false });
+      e.target.value = '';
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleDownloadDraft = async (draft) => {
+    if (!draft.url || draft.url === '#') {
+      alert('此草稿沒有可用的下載連結。');
+      return;
+    }
+    if (draft.url.startsWith('indexeddb://')) {
+      const fileId = draft.url.replace('indexeddb://', '');
+      const fileRecord = await getFileFromIndexedDB(fileId);
+      if (fileRecord) {
+        const byteCharacters = atob(fileRecord.base64Content);
+        const byteArray = new Uint8Array(byteCharacters.length);
+        for (let i = 0; i < byteCharacters.length; i++) byteArray[i] = byteCharacters.charCodeAt(i);
+        const blob = new Blob([byteArray], { type: fileRecord.mimeType });
+        const blobUrl = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = blobUrl;
+        a.download = draft.filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(blobUrl);
+      } else {
+        alert('找不到本地檔案記錄。');
+      }
+    } else if (draft.url.startsWith('data:')) {
+      const a = document.createElement('a');
+      a.href = draft.url;
+      a.download = draft.filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    } else {
+      const driveIdMatch = draft.url.match(/\/d\/([a-zA-Z0-9_-]+)/);
+      const apiUrl = import.meta.env.VITE_GAS_API_URL;
+      if (driveIdMatch && apiUrl && !apiUrl.includes('YOUR_DEPLOYMENT_ID')) {
+        try {
+          const res = await axios.get(apiUrl, { params: { action: 'getFile', fileId: driveIdMatch[1] } });
+          if (res.data && res.data.status === 'success') {
+            const { base64Content, mimeType, fileName } = res.data;
+            const byteCharacters = atob(base64Content);
+            const byteArray = new Uint8Array(byteCharacters.length);
+            for (let i = 0; i < byteCharacters.length; i++) byteArray[i] = byteCharacters.charCodeAt(i);
+            const blob = new Blob([byteArray], { type: mimeType });
+            const blobUrl = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = blobUrl;
+            a.download = fileName || draft.filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(blobUrl);
+            return;
+          }
+        } catch (err) {
+          console.error('Failed to fetch draft from GAS:', err);
+        }
+      }
+      window.open(draft.url, '_blank', 'noopener,noreferrer');
+    }
+  };
+
+  const handleDeleteDraft = (id) => {
+    const updated = drafts.filter(d => d.id !== id);
+    setDrafts(updated);
+    syncWithDatabase({ drafts: updated });
   };
 
   const getProviderName = (type) => {
@@ -187,6 +887,17 @@ export default function StepViews() {
 
   const renderStepContent = () => {
     const stepInfo = steps.find(s => s.id === currentStep);
+
+    if (isLoading) {
+      return (
+        <Card title="Loading Data">
+          <div className="flex flex-col items-center justify-center py-20">
+            <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-brand mb-4"></div>
+            <p className="text-sm text-slate-500 font-medium">Loading database records...</p>
+          </div>
+        </Card>
+      );
+    }
 
     const renderRestrictedArea = (title) => (
       <Card title={title}>
@@ -253,31 +964,31 @@ export default function StepViews() {
             </div>
             <div className="mt-6 flex justify-end space-x-3 border-t pt-6">
               <Button variant="secondary">Cancel</Button>
-              <Button icon={Save} variant="primary">Generate & Save Profile</Button>
+              <Button icon={Save} variant="primary" onClick={() => { syncWithDatabase(); alert('Profile saved successfully!'); }}>Generate & Save Profile</Button>
             </div>
           </Card>
         );
       case 2:
         return (
-          <Card title="Stakeholder & Timeline Setup">
-            <p className="text-sm text-slate-500 mb-6">Assign responsibilities and define the critical path for the project scopes.</p>
+          <Card title="Key Person">
+            <p className="text-sm text-slate-500 mb-6">Assign responsibilities for the project scopes.</p>
             
             {/* Related Person in Charge */}
             <div className="mb-6">
               <h4 className="text-sm font-bold text-slate-700 bg-blue-50/80 px-5 py-2.5 border-b border-blue-100 rounded-t-lg">Related Person in Charge</h4>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-1 p-5 border border-t-0 border-slate-200 rounded-b-lg bg-white">
-                <Input label="PD" />
-                <Input label="EIC" />
-                <Input label="PIC" />
-                <Input label="Safety" />
-                <Input label="Site Representative" />
-                <Input label="QA" />
-                <Input label="Design" />
-                <Input label="Project Secretary" />
-                <Input label="PQS" />
-                <Input label="Plant Representative" />
-                <Input label="Procurement" />
-                <Input label="Electrician" />
+                <Input label="PD" value={kpPD || (isTarget ? 'Lau Shing Chi (Crimson)' : '')} onChange={(e) => setKpPD(e.target.value)} />
+                <Input label="EIC" value={kpEIC || (isTarget ? 'Wai Hon Man' : '')} onChange={(e) => setKpEIC(e.target.value)} />
+                <Input label="PIC" value={kpPIC || (isTarget ? 'Wong Lok Kwan (Lok)' : '')} onChange={(e) => setKpPIC(e.target.value)} />
+                <Input label="Safety" value={kpSafety || (isTarget ? 'So Ming Lok (Edvard)' : '')} onChange={(e) => setKpSafety(e.target.value)} />
+                <Input label="Site Representative" value={kpSiteRep || (isTarget ? 'Chiu Kin Wing' : '')} onChange={(e) => setKpSiteRep(e.target.value)} />
+                <Input label="QA" value={kpQA || (isTarget ? 'Chan Yuet Man (Moon)、Ng Yui Yau (Oceanna)' : '')} onChange={(e) => setKpQA(e.target.value)} />
+                <Input label="Design" value={kpDesign || (isTarget ? 'Chan Wai Lok (Mars)' : '')} onChange={(e) => setKpDesign(e.target.value)} />
+                <Input label="Project Secretary" value={kpSec || (isTarget ? 'Tam Kit Yi (Kit)' : '')} onChange={(e) => setKpSec(e.target.value)} />
+                <Input label="PQS" value={kpPQS || (isTarget ? 'Cheung Yee Man (Tobey)' : '')} onChange={(e) => setKpPQS(e.target.value)} />
+                <Input label="Plant Representative" value={kpPlantRep || ''} onChange={(e) => setKpPlantRep(e.target.value)} />
+                <Input label="Procurement" value={kpProcurement || (isTarget ? 'Lun Yik Wun (Rachel)' : '')} onChange={(e) => setKpProcurement(e.target.value)} />
+                <Input label="Electrician" value={kpElectrician || ''} onChange={(e) => setKpElectrician(e.target.value)} />
               </div>
             </div>
 
@@ -285,43 +996,14 @@ export default function StepViews() {
             <div className="mb-6">
               <h4 className="text-sm font-bold text-slate-700 bg-blue-50/80 px-5 py-2.5 border-b border-blue-100 rounded-t-lg">Site Team</h4>
               <div className="grid grid-cols-1 gap-y-1 p-5 border border-t-0 border-slate-200 rounded-b-lg bg-white">
-                <Input label="Supervisor and Engineer" type="textarea" />
-                <Input label="Administration Staff" type="textarea" />
-                <Input label="Others Staff" type="textarea" />
-              </div>
-            </div>
-
-            {/* Timeline Setup by Scope */}
-            <div className="mb-6">
-              <h4 className="text-sm font-bold text-slate-700 bg-blue-50/80 px-5 py-2.5 border-b border-blue-100 rounded-t-lg">Timeline Setup by Scope</h4>
-              <div className="p-5 border border-t-0 border-slate-200 rounded-b-lg bg-white">
-                <div className="grid grid-cols-12 gap-4 mb-3 px-2 hidden md:grid border-b border-slate-100 pb-2">
-                  <div className="col-span-4 text-xs font-semibold text-slate-500 uppercase tracking-wider">Scope of Works</div>
-                  <div className="col-span-4 text-xs font-semibold text-slate-500 uppercase tracking-wider">Expected Start Date</div>
-                  <div className="col-span-4 text-xs font-semibold text-slate-500 uppercase tracking-wider">Expected End Date</div>
-                </div>
-                
-                {['Foundation', 'Pile Cap', 'ELS', 'Hoarding', 'Steel Platform', 'Others'].map((scope) => (
-                  <div key={scope} className="grid grid-cols-1 md:grid-cols-12 gap-4 items-center p-2 border-b border-slate-100 last:border-0 hover:bg-slate-50 transition-colors rounded-md">
-                    <div className="col-span-4 font-medium text-slate-700 text-sm flex items-center">
-                      <span className="w-1.5 h-1.5 rounded-full bg-brand mr-2"></span>
-                      {scope}
-                    </div>
-                    <div className="col-span-4">
-                      <span className="md:hidden text-xs text-slate-500 uppercase font-semibold block mb-1">Expected Start Date</span>
-                      <input type="date" className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-brand focus:outline-none focus:ring-1 focus:ring-brand bg-white text-slate-800" />
-                    </div>
-                    <div className="col-span-4">
-                      <span className="md:hidden text-xs text-slate-500 uppercase font-semibold block mb-1">Expected End Date</span>
-                      <input type="date" className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-brand focus:outline-none focus:ring-1 focus:ring-brand bg-white text-slate-800" />
-                    </div>
-                  </div>
-                ))}
+                <Input label="Supervisor and Engineer" type="textarea" value={kpSupervisorEngineer} onChange={(e) => setKpSupervisorEngineer(e.target.value)} />
+                <Input label="Administration Staff" type="textarea" value={kpAdminStaff} onChange={(e) => setKpAdminStaff(e.target.value)} />
+                <Input label="Others Staff" type="textarea" value={kpOthersStaff} onChange={(e) => setKpOthersStaff(e.target.value)} />
               </div>
             </div>
 
             <div className="mt-6 flex justify-end border-t pt-6">
-              <Button icon={Save} variant="primary">Save Stakeholders & Timeline</Button>
+              <Button icon={Save} variant="primary" onClick={() => { syncWithDatabase(); alert('Saved successfully!'); }}>Save Key Person</Button>
             </div>
           </Card>
         );
@@ -334,17 +1016,57 @@ export default function StepViews() {
               {/* Left Column: Basic Info & Context */}
               <div className="space-y-6">
                 <div className="bg-slate-50 p-5 rounded-lg border border-slate-200">
-                  <Input label="Package Title" defaultValue={`${pkg.name || ''} - ${submission.name || ''}`} />
-                  <Input label="Purpose & Context" type="textarea" />
+                  <Input label="Package Title" value={packageTitle} onChange={(e) => setPackageTitle(e.target.value)} />
+                  <Input label="Purpose & Context" type="textarea" value={purposeContext} onChange={(e) => setPurposeContext(e.target.value)} />
                   
                   {/* File Upload Area */}
                   <div className="mt-4">
                     <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Supporting Documents</label>
-                    <div className="border-2 border-dashed border-slate-300 bg-white rounded-lg p-6 text-center hover:bg-slate-50 transition-colors cursor-pointer group">
+                    <input 
+                      type="file" 
+                      id="step3-file-input" 
+                      className="hidden" 
+                      onChange={handleStep3FileUpload} 
+                    />
+                    <div 
+                      onClick={() => !isUploadingFile && document.getElementById('step3-file-input').click()}
+                      className={clsx(
+                        "border-2 border-dashed border-slate-300 bg-white rounded-lg p-6 text-center hover:bg-slate-50 transition-colors cursor-pointer group",
+                        isUploadingFile && "opacity-55 cursor-not-allowed"
+                      )}
+                    >
                       <UploadCloud className="w-6 h-6 text-slate-400 group-hover:text-brand mx-auto mb-2 transition-colors" />
-                      <p className="text-sm text-slate-600">Drag & drop files or click to browse</p>
+                      <p className="text-sm text-slate-600">
+                        {isUploadingFile ? "Uploading file..." : "Drag & drop files or click to browse"}
+                      </p>
                       <p className="text-xs text-slate-400 mt-1">Upload context docs, BD/ASD guidelines</p>
                     </div>
+
+                    {/* Uploaded Documents List */}
+                    {supportingDocs && supportingDocs.length > 0 && (
+                      <div className="mt-4 space-y-2">
+                        <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider">Uploaded Documents</label>
+                        <div className="bg-white rounded-lg border border-slate-200 divide-y divide-slate-100 shadow-sm">
+                          {supportingDocs.map((doc, idx) => (
+                            <div key={idx} className="flex items-center justify-between p-3 text-sm">
+                              <button 
+                                onClick={() => handleDownloadDoc(doc)}
+                                className="text-brand font-medium hover:underline flex items-center text-left truncate max-w-[240px]"
+                              >
+                                <FileText className="w-4 h-4 mr-2 text-slate-400 flex-shrink-0" />
+                                <span className="truncate">{doc.name}</span>
+                              </button>
+                              <button 
+                                onClick={() => handleRemoveDoc(idx)} 
+                                className="text-xs text-red-500 hover:text-red-700 font-bold transition-colors ml-2"
+                              >
+                                Delete
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
                   </div>
                 </div>
 
@@ -364,9 +1086,9 @@ export default function StepViews() {
               <div className="bg-slate-50 p-5 rounded-lg border border-slate-200">
                 <h4 className="text-sm font-bold text-slate-700 mb-4 pb-2 border-b border-slate-200">Critical Milestone Dates</h4>
                 <div className="space-y-4">
-                  <Input label="Start Date" type="date" />
-                  <Input label="Target Design Completion Date" type="date" />
-                  <Input label="Target Review & Reply Completion Date" type="date" />
+                  <Input label="Start Date" type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} />
+                  <Input label="Target Design Completion Date" type="date" value={targetDesignDate} onChange={(e) => setTargetDesignDate(e.target.value)} />
+                  <Input label="Target Review & Reply Completion Date" type="date" value={targetReviewDate} onChange={(e) => setTargetReviewDate(e.target.value)} />
                   
                   <div className="pt-4 border-t border-slate-200">
                     <div className="mb-4">
@@ -407,7 +1129,7 @@ export default function StepViews() {
             </div>
 
             <div className="mt-6 flex justify-end border-t pt-6">
-              <Button icon={Save} variant="primary">Save Package Schedule</Button>
+              <Button icon={Save} variant="primary" onClick={() => { syncWithDatabase(); alert('Saved successfully!'); }}>Save Package Schedule</Button>
             </div>
           </Card>
         );
@@ -450,20 +1172,40 @@ export default function StepViews() {
                     </div>
                   </div>
                   
-                  <div className="border-2 border-dashed border-brand/30 bg-white rounded-lg p-6 text-center hover:bg-brand/5 transition-colors cursor-pointer group mt-2">
+                  <input
+                    id="step4-file-input"
+                    type="file"
+                    className="hidden"
+                    accept=".pdf,.dwg,.rvt,.png,.jpg,.jpeg,.xlsx,.docx"
+                    onChange={handleStep4FileUpload}
+                    disabled={isUploadingInput}
+                  />
+                  <div
+                    onClick={() => !isUploadingInput && document.getElementById('step4-file-input').click()}
+                    className={clsx(
+                      "border-2 border-dashed border-brand/30 bg-white rounded-lg p-6 text-center transition-colors group mt-2",
+                      isUploadingInput ? "opacity-60 cursor-not-allowed" : "hover:bg-brand/5 cursor-pointer"
+                    )}
+                  >
                     <UploadCloud className="w-8 h-8 text-brand mx-auto mb-2 opacity-80 group-hover:opacity-100 transition-opacity" />
-                    <p className="text-sm text-slate-600 font-medium">Click to Browse or Drag & Drop Input Files</p>
+                    <p className="text-sm text-slate-600 font-medium">
+                      {isUploadingInput ? 'Uploading file...' : 'Click to Browse or Drag & Drop Input Files'}
+                    </p>
                     <p className="text-xs text-slate-400 mt-1">PDF, DWG, RVT, Images up to 500MB</p>
                   </div>
-                  
                   <div className="flex justify-end mt-4">
-                    <Button icon={Save} variant="primary">Save & Register Record</Button>
+                    <Button icon={Save} variant="primary" onClick={() => { syncWithDatabase(); }}>Save Design Input</Button>
                   </div>
                 </div>
 
-                {/* Uploaded Records Table */}
+                {/* Registered Inputs Table */}
                 <div>
                   <h4 className="text-sm font-bold text-slate-700 mb-3">Registered Inputs</h4>
+                  {uploadedInputs.length === 0 ? (
+                    <div className="text-center py-10 bg-slate-50 rounded-lg border border-slate-200 text-slate-400 text-sm">
+                      No input files registered yet.
+                    </div>
+                  ) : (
                   <div className="overflow-hidden rounded-lg border border-slate-200">
                     <table className="w-full text-sm text-left text-slate-600">
                       <thead className="text-xs text-slate-700 uppercase bg-slate-50 border-b border-slate-200">
@@ -472,23 +1214,38 @@ export default function StepViews() {
                           <th className="px-4 py-3">Provider Role</th>
                           <th className="px-4 py-3">Provider Name</th>
                           <th className="px-4 py-3">Date Received</th>
+                          <th className="px-4 py-3"></th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-100 bg-white">
                         {uploadedInputs.map(file => (
                           <tr key={file.id} className="hover:bg-slate-50 transition-colors">
-                            <td className="px-4 py-3 font-medium text-brand hover:underline cursor-pointer flex items-center">
-                              <FileText className="w-4 h-4 mr-2 text-slate-400" />
-                              {file.filename}
+                            <td className="px-4 py-3">
+                              <button
+                                onClick={() => handleDownloadInput(file)}
+                                className="font-medium text-brand hover:underline flex items-center text-left"
+                              >
+                                <FileText className="w-4 h-4 mr-2 text-slate-400 flex-shrink-0" />
+                                {file.filename}
+                              </button>
                             </td>
                             <td className="px-4 py-3"><span className="px-2 py-1 bg-blue-50 text-blue-700 rounded text-xs font-semibold">{file.providerType}</span></td>
                             <td className="px-4 py-3">{file.providerName}</td>
                             <td className="px-4 py-3">{file.receiveDate}</td>
+                            <td className="px-4 py-3 text-right">
+                              <button
+                                onClick={() => handleDeleteInput(file.id)}
+                                className="text-xs font-semibold text-red-500 hover:text-red-700 transition-colors"
+                              >
+                                Delete
+                              </button>
+                            </td>
                           </tr>
                         ))}
                       </tbody>
                     </table>
                   </div>
+                  )}
                 </div>
               </div>
             ) : (
@@ -504,22 +1261,73 @@ export default function StepViews() {
         );
       case 5:
         const currentDraftVersion = `D${drafts.length}`;
-        const latestDraft = drafts[0];
+        const currentTargetDraft = drafts.length > 0 ? drafts[0].version : 'D0';
+        const effectiveTargetDraft = commentTargetDraft || currentTargetDraft;
+
+        const handleAddComment = () => {
+          if (!newCommentText.trim()) return;
+          const newComment = {
+            id: `COM-00${comments.length + 1}`,
+            authorRole: currentRole,
+            time: 'Just now',
+            severity: 'Normal',
+            content: newCommentText,
+            targetDraft: effectiveTargetDraft,
+            reply: null,
+            hasImage: true
+          };
+          const updated = [newComment, ...comments];
+          setComments(updated);
+          setNewCommentText('');
+          setShowCommentForm(false);
+          syncWithDatabase({ comments: updated });
+        };
+
+        const handleReply = (id) => {
+          if (!replyText.trim() && !replyImage) return;
+          const now = new Date();
+          const timeStr = `${now.toISOString().slice(0, 10)} ${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
+          const updated = comments.map(c =>
+            c.id === id ? { ...c, reply: { authorRole: currentRole, text: replyText, image: replyImage, time: timeStr } } : c
+          );
+          setComments(updated);
+          setReplyTextId(null);
+          setReplyText('');
+          setReplyImage(null);
+          syncWithDatabase({ comments: updated });
+        };
 
         return (
-          <Card title="Internal Draft Issuance">
+          <Card title="Draft & Internal Review">
+            {/* Tab switcher */}
+            <div className="flex space-x-1 bg-slate-100 rounded-lg p-1 mb-6 w-fit">
+              <button onClick={() => setStep5Tab('draft')} className={clsx('px-4 py-1.5 rounded-md text-sm font-semibold transition-all', step5Tab === 'draft' ? 'bg-white text-brand shadow-sm' : 'text-slate-500 hover:text-slate-700')}>Draft Issuance</button>
+              <button onClick={() => setStep5Tab('review')} className={clsx('px-4 py-1.5 rounded-md text-sm font-semibold transition-all', step5Tab === 'review' ? 'bg-white text-brand shadow-sm' : 'text-slate-500 hover:text-slate-700')}>Internal Review</button>
+            </div>
+
+            {step5Tab === 'draft' && <>
             <p className="text-sm text-slate-500 mb-6">Upload the design draft for internal review by QS, Site Team, Tender, and Procurement.</p>
-            
+
             {/* Upload Area */}
             {currentRole === 'Design' ? (
-              <div onClick={handleUploadDraft} className="border-2 border-dashed border-brand/30 bg-white rounded-xl p-10 text-center hover:bg-brand/5 transition-colors cursor-pointer group mb-8">
-                <UploadCloud className="w-10 h-10 text-brand mx-auto mb-3 opacity-80 group-hover:opacity-100 transition-opacity" />
-                <h4 className="text-lg font-bold text-slate-800 flex items-center justify-center">
-                  Drag & Drop Draft Document Here
-                </h4>
-                <p className="text-sm text-slate-500 mt-2">Target Revision: <span className="font-bold text-brand bg-brand/10 px-2 py-0.5 rounded ml-1">{currentDraftVersion}</span></p>
-                <p className="text-xs text-slate-400 mt-1">Supports PDF, DWG up to 500MB</p>
-              </div>
+              <>
+                <input
+                  id="step5-file-input"
+                  type="file"
+                  className="hidden"
+                  accept=".pdf,.dwg,.rvt,.png,.jpg,.jpeg"
+                  onChange={handleUploadDraft}
+                />
+                <div
+                  onClick={() => document.getElementById('step5-file-input').click()}
+                  className="border-2 border-dashed border-brand/30 bg-white rounded-xl p-10 text-center hover:bg-brand/5 transition-colors cursor-pointer group mb-8"
+                >
+                  <UploadCloud className="w-10 h-10 text-brand mx-auto mb-3 opacity-80 group-hover:opacity-100 transition-opacity" />
+                  <h4 className="text-lg font-bold text-slate-800">Drag & Drop Draft Document Here</h4>
+                  <p className="text-sm text-slate-500 mt-2">Next Revision: <span className="font-bold text-brand bg-brand/10 px-2 py-0.5 rounded ml-1">{currentDraftVersion}</span></p>
+                  <p className="text-xs text-slate-400 mt-1">Supports PDF, DWG up to 500MB</p>
+                </div>
+              </>
             ) : (
               <div className="flex items-center justify-between bg-slate-50 p-5 rounded-lg border border-slate-200 mb-8">
                 <div className="flex items-center space-x-4">
@@ -528,7 +1336,7 @@ export default function StepViews() {
                   </div>
                   <div>
                     <h4 className="font-bold text-slate-800 text-lg flex items-center">
-                      Target Revision: <span className="ml-2 bg-brand text-white px-2 py-0.5 rounded text-sm">{currentDraftVersion}</span>
+                      Next Revision: <span className="ml-2 bg-brand text-white px-2 py-0.5 rounded text-sm">{currentDraftVersion}</span>
                     </h4>
                     <p className="text-sm text-slate-500 mt-1">Pending upload by Design In-charge</p>
                   </div>
@@ -538,9 +1346,13 @@ export default function StepViews() {
             )}
 
             {/* Draft History Table */}
-            {drafts.length > 0 && (
-              <div>
-                <h4 className="text-sm font-bold text-slate-700 mb-3">Draft Issuance History</h4>
+            <div>
+              <h4 className="text-sm font-bold text-slate-700 mb-3">Draft Issuance History</h4>
+              {drafts.length === 0 ? (
+                <div className="text-center py-10 bg-slate-50 rounded-lg border border-slate-200 text-slate-400 text-sm">
+                  No drafts uploaded yet.
+                </div>
+              ) : (
                 <div className="overflow-hidden rounded-lg border border-slate-200">
                   <table className="w-full text-sm text-left text-slate-600">
                     <thead className="text-xs text-slate-700 uppercase bg-slate-50 border-b border-slate-200">
@@ -556,9 +1368,14 @@ export default function StepViews() {
                       {drafts.map((draft, idx) => (
                         <tr key={draft.id} className={idx === 0 ? "bg-blue-50/30" : "hover:bg-slate-50"}>
                           <td className="px-5 py-4 font-bold text-slate-800">{draft.version}</td>
-                          <td className="px-5 py-4 font-medium text-brand hover:underline cursor-pointer flex items-center">
-                            <FileText className="w-4 h-4 mr-2 text-slate-400" />
-                            {draft.filename}
+                          <td className="px-5 py-4">
+                            <button
+                              onClick={() => handleDownloadDraft(draft)}
+                              className="font-medium text-brand hover:underline flex items-center text-left"
+                            >
+                              <FileText className="w-4 h-4 mr-2 text-slate-400 flex-shrink-0" />
+                              {draft.filename}
+                            </button>
                           </td>
                           <td className="px-5 py-4">{draft.uploadTime}</td>
                           <td className="px-5 py-4">
@@ -569,64 +1386,39 @@ export default function StepViews() {
                             )}
                           </td>
                           <td className="px-5 py-4 text-right">
-                            {idx === 0 && currentRole === 'Design' && !isDraftNotified ? (
-                              <button 
-                                onClick={() => setIsDraftNotified(true)}
-                                className="inline-flex items-center justify-end px-3 py-1.5 rounded-md text-xs font-bold bg-orange-50 border border-orange-200 text-orange-700 hover:bg-orange-100 hover:border-orange-300 transition-all shadow-sm"
-                              >
-                                <MessageSquare className="w-3.5 h-3.5 mr-1.5" /> Notify Reviewers
-                              </button>
-                            ) : idx === 0 && isDraftNotified ? (
-                               <span className="inline-flex items-center text-xs font-bold text-emerald-600">
-                                 <CheckCircle className="w-4 h-4 mr-1.5" /> Notified
-                               </span>
-                            ) : null}
+                            <div className="flex items-center justify-end gap-3">
+                              {idx === 0 && currentRole === 'Design' && !isDraftNotified ? (
+                                <button
+                                  onClick={() => { setIsDraftNotified(true); syncWithDatabase({ isDraftNotified: true }); }}
+                                  className="inline-flex items-center px-3 py-1.5 rounded-md text-xs font-bold bg-orange-50 border border-orange-200 text-orange-700 hover:bg-orange-100 transition-all"
+                                >
+                                  <MessageSquare className="w-3.5 h-3.5 mr-1.5" /> Notify Reviewers
+                                </button>
+                              ) : idx === 0 && isDraftNotified ? (
+                                <span className="inline-flex items-center text-xs font-bold text-emerald-600">
+                                  <CheckCircle className="w-4 h-4 mr-1.5" /> Notified
+                                </span>
+                              ) : null}
+                              {currentRole === 'Design' && (
+                                <button
+                                  onClick={() => handleDeleteDraft(draft.id)}
+                                  className="text-xs font-semibold text-red-500 hover:text-red-700 transition-colors"
+                                >
+                                  Delete
+                                </button>
+                              )}
+                            </div>
                           </td>
                         </tr>
                       ))}
                     </tbody>
                   </table>
                 </div>
-              </div>
-            )}
-          </Card>
-        );
-      case 6:
-        const currentTargetDraft = drafts.length > 0 ? drafts[0].version : 'D0';
-        const effectiveTargetDraft = commentTargetDraft || currentTargetDraft;
+              )}
+            </div>
+            </>}
 
-        const handleAddComment = () => {
-          if (!newCommentText.trim()) return;
-          const newComment = {
-            id: `COM-00${comments.length + 1}`,
-            authorRole: currentRole,
-            time: 'Just now',
-            severity: 'Normal',
-            content: newCommentText,
-            targetDraft: effectiveTargetDraft,
-            reply: null,
-            hasImage: true 
-          };
-          setComments([newComment, ...comments]);
-          setNewCommentText('');
-          setShowCommentForm(false);
-        };
-
-        const handleReply = (id) => {
-          if (!replyText.trim() && !replyImage) return;
-          const now = new Date();
-          const timeStr = `${now.toISOString().slice(0, 10)} ${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
-          
-          setComments(comments.map(c => 
-            c.id === id ? { ...c, reply: { authorRole: currentRole, text: replyText, image: replyImage, time: timeStr } } : c
-          ));
-          setReplyTextId(null);
-          setReplyText('');
-          setReplyImage(null);
-        };
-
-        return (
-          <Card title="Internal Review & Coordination">
+            {step5Tab === 'review' && <>
             <div className="flex justify-between items-end mb-4">
               <div>
                 <p className="text-sm text-slate-500 mb-1">Cross-department comments and responses.</p>
@@ -766,9 +1558,33 @@ export default function StepViews() {
                 </tbody>
               </table>
             </div>
+            </>}
           </Card>
         );
-      case 7:
+      case 6:
+        const handleAddConsultantFeedback = () => {
+          if (!cfFile) { alert('Please upload a Comment Form/Mark-up File.'); return; }
+          if (!cfDescription.trim()) { alert('Please provide a comment description.'); return; }
+          const nowCf = new Date();
+          const timeStrCf = `${nowCf.toISOString().slice(0, 10)} ${nowCf.getHours().toString().padStart(2, '0')}:${nowCf.getMinutes().toString().padStart(2, '0')}`;
+          const newFeedback = { id: `CF-${consultantFeedbacks.length + 1}`, date: cfReceivedDate, file: cfFile, description: cfDescription, uploader: currentRole, uploadTime: timeStrCf, reply: null };
+          const updatedCf = [newFeedback, ...consultantFeedbacks];
+          setConsultantFeedbacks(updatedCf);
+          setCfFile(null);
+          setCfDescription('');
+          syncWithDatabase({ consultantFeedbacks: updatedCf });
+        };
+
+        const handleCfReply = (id) => {
+          if (!cfReplyText.trim() && !cfReplyImage) return;
+          const nowCfR = new Date();
+          const timeStrCfR = `${nowCfR.toISOString().slice(0, 10)} ${nowCfR.getHours().toString().padStart(2, '0')}:${nowCfR.getMinutes().toString().padStart(2, '0')}`;
+          const updatedCfR = consultantFeedbacks.map(cf => cf.id === id ? { ...cf, reply: { authorRole: currentRole, text: cfReplyText, image: cfReplyImage, time: timeStrCfR } } : cf);
+          setConsultantFeedbacks(updatedCfR);
+          setCfReplyId(null); setCfReplyText(''); setCfReplyImage(null);
+          syncWithDatabase({ consultantFeedbacks: updatedCfR });
+        };
+
         const handleIssueSubmission = () => {
           if (!formalSubmissionFile) {
             alert('Please upload the Formal Submission Document first.');
@@ -792,18 +1608,27 @@ export default function StepViews() {
             link: uploadRef,
             fileName: formalSubmissionFile
           };
-          setFormalSubmissions([newSub, ...formalSubmissions]);
+          const updated = [newSub, ...formalSubmissions];
+          setFormalSubmissions(updated);
           
           const nextNum = parseInt(issueRound.replace('C', '')) + 1;
           setIssueRound(`C${nextNum}`);
           setUploadRef('');
           setFormalSubmissionFile(null);
+          syncWithDatabase({ formalSubmissions: updated });
         };
 
         return (
-          <Card title="Formal Consultant Submission">
+          <Card title="Formal Submission & Consultant Feedback">
+            {/* Tab switcher */}
+            <div className="flex space-x-1 bg-slate-100 rounded-lg p-1 mb-6 w-fit">
+              <button onClick={() => setStep6Tab('formal')} className={clsx('px-4 py-1.5 rounded-md text-sm font-semibold transition-all', step6Tab === 'formal' ? 'bg-white text-brand shadow-sm' : 'text-slate-500 hover:text-slate-700')}>Formal Submission</button>
+              <button onClick={() => setStep6Tab('feedback')} className={clsx('px-4 py-1.5 rounded-md text-sm font-semibold transition-all', step6Tab === 'feedback' ? 'bg-white text-brand shadow-sm' : 'text-slate-500 hover:text-slate-700')}>Consultant Feedback</button>
+            </div>
+
+            {step6Tab === 'formal' && <>
             <p className="text-sm text-slate-500 mb-6">Freeze the draft version and officially issue it to the consultant.</p>
-            
+
             {currentRole === 'Design' ? (
               <div className="bg-slate-50 p-6 rounded-lg border border-slate-200 mb-8">
                 <h4 className="text-sm font-bold text-slate-700 mb-4">New Formal Issue</h4>
@@ -950,54 +1775,11 @@ export default function StepViews() {
                 </div>
               </div>
             )}
-          </Card>
-        );
-      case 8:
-        if (currentRole !== 'Design' && currentRole !== 'Site Team') return renderRestrictedArea(stepInfo.title);
+            </>}
 
-        const handleAddConsultantFeedback = () => {
-          if (!cfFile) {
-            alert('Please upload a Comment Form/Mark-up File.');
-            return;
-          }
-          if (!cfDescription.trim()) {
-            alert('Please provide a comment description.');
-            return;
-          }
-          const now = new Date();
-          const timeStr = `${now.toISOString().slice(0, 10)} ${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
-          
-          const newFeedback = {
-            id: `CF-${consultantFeedbacks.length + 1}`,
-            date: cfReceivedDate,
-            file: cfFile,
-            description: cfDescription,
-            uploader: currentRole,
-            uploadTime: timeStr,
-            reply: null
-          };
-          setConsultantFeedbacks([newFeedback, ...consultantFeedbacks]);
-          setCfFile(null);
-          setCfDescription('');
-        };
-
-        const handleCfReply = (id) => {
-          if (!cfReplyText.trim() && !cfReplyImage) return;
-          const now = new Date();
-          const timeStr = `${now.toISOString().slice(0, 10)} ${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
-          
-          setConsultantFeedbacks(consultantFeedbacks.map(cf => 
-            cf.id === id ? { ...cf, reply: { authorRole: currentRole, text: cfReplyText, image: cfReplyImage, time: timeStr } } : cf
-          ));
-          setCfReplyId(null);
-          setCfReplyText('');
-          setCfReplyImage(null);
-        };
-
-        return (
-          <Card title="Consultant Feedback Log">
+            {step6Tab === 'feedback' && <>
             <p className="text-sm text-slate-500 mb-6">Track and manage external consultant comments and mark-ups.</p>
-            
+
             <div className="bg-slate-50 p-6 rounded-lg border border-slate-200 mb-8 shadow-sm">
               <h4 className="text-sm font-bold text-slate-700 mb-4">Record New Feedback</h4>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
@@ -1119,16 +1901,15 @@ export default function StepViews() {
                 </div>
               </div>
             )}
+            </>}
           </Card>
         );
-      case 9:
+      case 7:
         if (currentRole !== 'Design' && currentRole !== 'Site Team') return renderRestrictedArea(stepInfo.title);
 
         const handleAddStatutorySubmission = () => {
           if (!ssRtcComplete) {
             alert('Please confirm Consultant R to C table is completed.');
-            return;
-            alert('Consultant R to C table must be completed before recording submission.');
             return;
           }
           if (!ssSubmittedDate) {
@@ -1154,11 +1935,13 @@ export default function StepViews() {
             uploader: currentRole,
             uploadTime: timeStr
           };
-          setStatutorySubmissions([newSub, ...statutorySubmissions]);
+          const updated = [newSub, ...statutorySubmissions];
+          setStatutorySubmissions(updated);
           setSsDrawingsFile(null);
           setSsReportFile(null);
           setSsRtcComplete(false);
           setSsNotifyDue(false);
+          syncWithDatabase({ statutorySubmissions: updated });
         };
 
         const calculatedDueDateDisplay = () => {
@@ -1294,7 +2077,7 @@ export default function StepViews() {
             )}
           </Card>
         );
-      case 10:
+      case 8:
         if (currentRole !== 'Design' && currentRole !== 'Site Team') return renderRestrictedArea(stepInfo.title);
 
         const handleAddAuthorityComment = () => {
@@ -1318,9 +2101,11 @@ export default function StepViews() {
             uploadTime: timeStr,
             reply: null
           };
-          setAuthorityComments([newComment, ...authorityComments]);
+          const updated = [newComment, ...authorityComments];
+          setAuthorityComments(updated);
           setAcFile(null);
           setAcDescription('');
+          syncWithDatabase({ authorityComments: updated });
         };
 
         const handleAcReply = (id) => {
@@ -1328,12 +2113,14 @@ export default function StepViews() {
           const now = new Date();
           const timeStr = `${now.toISOString().slice(0, 10)} ${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
           
-          setAuthorityComments(authorityComments.map(ac => 
+          const updated = authorityComments.map(ac => 
             ac.id === id ? { ...ac, reply: { authorRole: currentRole, text: acReplyText, image: acReplyImage, time: timeStr } } : ac
-          ));
+          );
+          setAuthorityComments(updated);
           setAcReplyId(null);
           setAcReplyText('');
           setAcReplyImage(null);
+          syncWithDatabase({ authorityComments: updated });
         };
 
         return (
@@ -1463,7 +2250,7 @@ export default function StepViews() {
             )}
           </Card>
         );
-      case 11:
+      case 9:
         if (currentRole !== 'Design' && currentRole !== 'Site Team') return renderRestrictedArea(stepInfo.title);
 
         const handleAddFinalResponse = () => {
@@ -1479,9 +2266,11 @@ export default function StepViews() {
             date: new Date().toISOString().slice(0, 10),
             uploader: currentRole
           };
-          setFinalResponses([newResp, ...finalResponses]);
+          const updated = [newResp, ...finalResponses];
+          setFinalResponses(updated);
           setFrDrawingsFile(null);
           setFrReportFile(null);
+          syncWithDatabase({ finalResponses: updated });
         };
 
         return (
@@ -1571,7 +2360,7 @@ export default function StepViews() {
             )}
           </Card>
         );
-      case 12:
+      case 10:
         const handleAddApproval = () => {
           if (!appRef.trim() || (!appPdf && !appDrawingsFile)) {
             alert('Please provide Approval Reference and at least one document (Letter or Drawings).');
@@ -1587,11 +2376,13 @@ export default function StepViews() {
             conditions: appConditions,
             recorder: currentRole
           };
-          setApprovals([newApp, ...approvals]);
+          const updated = [newApp, ...approvals];
+          setApprovals(updated);
           setAppPdf(null);
           setAppDrawingsFile(null);
           setAppRef('');
           setAppConditions('');
+          syncWithDatabase({ approvals: updated });
         };
 
         const getStatusColor = (status) => {
@@ -1720,7 +2511,7 @@ export default function StepViews() {
             )}
           </Card>
         );
-      case 13:
+      case 11:
         const handleAddCostTracking = () => {
           if (!ctCostImpact.trim()) {
             alert('Please provide cost impact estimates.');
@@ -1733,9 +2524,11 @@ export default function StepViews() {
             date: new Date().toISOString().slice(0, 10),
             recorder: currentRole
           };
-          setCostTrackings([newTracking, ...costTrackings]);
+          const updated = [newTracking, ...costTrackings];
+          setCostTrackings(updated);
           setCtCostImpact('');
           setCtScheduleImpact('');
+          syncWithDatabase({ costTrackings: updated });
         };
 
         return (

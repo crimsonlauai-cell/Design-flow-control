@@ -1,8 +1,77 @@
 import { Link } from 'react-router-dom';
+import { useState, useEffect } from 'react';
 import { mockProjects } from '../data/mockProjects';
 import { FolderGit2, ArrowRight } from 'lucide-react';
+import axios from 'axios';
 
 export default function Dashboard() {
+  const [projectCounts, setProjectCounts] = useState({});
+
+  useEffect(() => {
+    const fetchCounts = async () => {
+      const apiUrl = import.meta.env.VITE_GAS_API_URL;
+      const isLocal = !apiUrl || apiUrl.includes('YOUR_DEPLOYMENT_ID');
+      
+      // 1. 同步從本地讀取預設值
+      const initialCounts = {};
+      mockProjects.forEach(project => {
+        const localKey = `design_flow_state_${project.id}_project_timeline`;
+        const cached = localStorage.getItem(localKey);
+        let count = 0;
+        if (cached) {
+          try {
+            const parsed = JSON.parse(cached);
+            if (parsed.scopesData) {
+              count = Object.values(parsed.scopesData).filter(s => s.checked).length;
+            }
+          } catch (e) {
+            console.error(e);
+          }
+        }
+        initialCounts[project.id] = count;
+      });
+      setProjectCounts(initialCounts);
+
+      if (isLocal) return;
+
+      // 2. 異步對每個專案打 API 獲取雲端最新真值，進行多用戶同步
+      mockProjects.forEach(async (project) => {
+        try {
+          const res = await axios.get(apiUrl, {
+            params: {
+              action: 'getState',
+              projectId: project.id,
+              packageId: 'project',
+              submissionId: 'timeline'
+            }
+          });
+          if (res.data && res.data.status === 'success' && res.data.stateData) {
+            const s = res.data.stateData;
+            if (s.scopesData) {
+              const count = Object.values(s.scopesData).filter(sc => sc.checked).length;
+              setProjectCounts(prev => ({
+                ...prev,
+                [project.id]: count
+              }));
+              // 同步更新本地快取
+              const localKey = `design_flow_state_${project.id}_project_timeline`;
+              localStorage.setItem(localKey, JSON.stringify(s));
+            }
+          } else if (res.data && res.data.status === 'not_found') {
+            // 雲端無 Timeline 資料，重置為 0
+            setProjectCounts(prev => ({
+              ...prev,
+              [project.id]: 0
+            }));
+          }
+        } catch (err) {
+          console.error(`Failed to fetch timeline count for project ${project.id}:`, err);
+        }
+      });
+    };
+    fetchCounts();
+  }, []);
+
   return (
     <div className="space-y-6">
       <div className="border-b pb-4">
@@ -40,7 +109,7 @@ export default function Dashboard() {
 
             <div className="flex items-center justify-between mt-4 pt-4 border-t border-slate-100">
               <span className="text-xs font-medium text-slate-500">
-                {project.packages.length} Packages
+                {projectCounts[project.id] !== undefined ? projectCounts[project.id] : 0} Packages
               </span>
               <span className="flex items-center text-sm font-medium text-brand">
                 View Details <ArrowRight className="w-4 h-4 ml-1 group-hover:translate-x-1 transition-transform" />
